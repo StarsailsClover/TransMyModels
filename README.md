@@ -154,6 +154,21 @@ weight for key #3: 1
 
 You can also edit the config file directly.
 
+### Key circuit breaker
+
+If a chosen key receives a 401 or 403 from the upstream, that key is marked
+disabled and the same request is immediately retried on another enabled key
+(automatic failover). Rate limits (429) and upstream outages (5xx) do not
+disable a key.
+
+A background task re-enables all disabled keys every hour so they are retried
+automatically. The `/health` endpoint reports the current disabled key count:
+
+```
+GET /health
+{"ok": true, "upstreams": 1, "disabled_keys": 0}
+```
+
 ## Config file
 
 `~/.transmymodels/config.json`:

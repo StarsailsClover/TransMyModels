@@ -145,6 +145,20 @@ weight for key #3: 1
 
 也可以直接编辑配置文件。
 
+### Key 熔断
+
+如果某个选中的 Key 收到上游返回的 401 或 403，该 Key 会被立即禁用，
+同时本次请求自动重试另一个可用 Key（故障转移）。限流（429）和上游故障
+（5xx）不会禁用 Key。
+
+后台每小时自动把所有被禁用的 Key 重新启用，让它们再试一次。
+`/health` 会返回当前被禁用的 Key 数量：
+
+```
+GET /health
+{"ok": true, "upstreams": 1, "disabled_keys": 0}
+```
+
 ## 配置文件
 
 `~/.transmymodels/config.json`：
