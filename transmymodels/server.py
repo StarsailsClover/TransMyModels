@@ -88,58 +88,6 @@ def _resolve(cfg: Config, routed_name: str) -> Optional[Tuple[Upstream, ModelMap
     return None
 
 
-async def _attempt(
-    client: httpx.AsyncClient,
-    upstream: Upstream,
-    mapping: ModelMapping,
-    path: str,
-    body: dict,
-    request: Request,
-    chosen_key: str,
-) -> Tuple[Response, bool]:
-    """One attempt against the upstream. Returns (response, is_key_bad)."""
-    body["model"] = mapping.upstream_model
-    url = upstream.base_url.rstrip("/") + path
-    headers = {
-        "Authorization": f"Bearer {chosen_key}",
-        "Content-Type": "application/json",
-        "Accept": request.headers.get("accept", "application/json"),
-    }
-    want_stream = bool(body.get("stream"))
-
-    if not want_stream:
-        r = await client.post(url, json=body, headers=headers)
-        return (
-            Response(
-                content=r.content,
-                status_code=r.status_code,
-                media_type=r.headers.get("content-type", "application/json"),
-            ),
-            r.status_code in KEY_BAD_STATUS,
-        )
-
-    # Streaming: check status before pumping bytes.
-    req = client.build_request("POST", url, json=body, headers=headers)
-    resp = await client.send(req, stream=True)
-    is_bad = resp.status_code in KEY_BAD_STATUS
-
-    async def gen() -> AsyncGenerator[bytes, None]:
-        try:
-            async for chunk in resp.aiter_raw():
-                yield chunk
-        finally:
-            await resp.aclose()
-
-    return (
-        StreamingResponse(
-            gen(),
-            status_code=resp.status_code,
-            media_type=resp.headers.get("content-type", "text/event-stream"),
-        ),
-        is_bad,
-    )
-
-
 async def _proxy_upstream(
     cfg: Config,
     upstream: Upstream,
@@ -148,38 +96,86 @@ async def _proxy_upstream(
     body: dict,
     request: Request,
 ) -> Response:
-    """Forward with automatic key failover on 401/403."""
+    """Forward with automatic key failover on 401/403.
+
+    Non-streaming: short-lived httpx client per attempt.
+    Streaming: the httpx client and upstream response are owned by the
+    StreamingResponse generator and closed when the stream ends or the client
+    disconnects. ReadError / RemoteProtocolError / CancelledError are normal
+    (client went away or upstream dropped mid-stream) and are swallowed.
+    """
     candidates = _choose_keys(upstream)
-    # Weighted order: shuffle candidates by weight so each attempt picks a
-    # different key, but higher-weight keys are tried first more often.
     keys = [k.key for k in candidates]
     weights = [max(1, k.weight) for k in candidates]
+    want_stream = bool(body.get("stream"))
 
-    async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
-        last_response: Optional[Response] = None
-        tried = set()
-        # Try up to len(candidates) times.
-        for _ in range(len(candidates)):
-            pool = [k for k in keys if k not in tried]
-            if not pool:
-                break
-            pool_weights = [weights[keys.index(k)] for k in pool]
-            chosen = random.choices(pool, weights=pool_weights, k=1)[0]
-            tried.add(chosen)
+    body["model"] = mapping.upstream_model
+    url = upstream.base_url.rstrip("/") + path
+    accept = request.headers.get("accept", "application/json")
 
-            response, is_bad = await _attempt(
-                client, upstream, mapping, path, body, request, chosen
-            )
-            last_response = response
-            if is_bad:
+    last_response: Optional[Response] = None
+    tried = set()
+
+    for _ in range(len(candidates)):
+        pool = [k for k in keys if k not in tried]
+        if not pool:
+            break
+        pool_weights = [weights[keys.index(k)] for k in pool]
+        chosen = random.choices(pool, weights=pool_weights, k=1)[0]
+        tried.add(chosen)
+
+        headers = {
+            "Authorization": f"Bearer {chosen}",
+            "Content-Type": "application/json",
+            "Accept": accept,
+        }
+
+        if not want_stream:
+            async with httpx.AsyncClient(timeout=HTTP_TIMEOUT) as client:
+                r = await client.post(url, json=body, headers=headers)
+            if r.status_code in KEY_BAD_STATUS:
                 _disable_key(chosen)
-                # Loop again with a different key.
                 continue
-            return response
-        # All keys tried and failed.
-        return last_response or JSONResponse(
-            {"error": {"message": "all upstream keys failed"}}, status_code=502
-        )
+            return Response(
+                content=r.content,
+                status_code=r.status_code,
+                media_type=r.headers.get("content-type", "application/json"),
+            )
+
+        # Streaming: open a client that lives inside the generator.
+        client = httpx.AsyncClient(timeout=HTTP_TIMEOUT)
+        try:
+            req = client.build_request("POST", url, json=body, headers=headers)
+            resp = await client.send(req, stream=True)
+        except (httpx.ConnectError, httpx.ConnectTimeout):
+            await client.aclose()
+            continue
+
+        if resp.status_code in KEY_BAD_STATUS:
+            _disable_key(chosen)
+            await resp.aclose()
+            await client.aclose()
+            continue
+
+        media_type = resp.headers.get("content-type", "text/event-stream")
+        status = resp.status_code
+
+        async def gen(resp=resp, client=client) -> AsyncGenerator[bytes, None]:
+            try:
+                async for chunk in resp.aiter_raw():
+                    yield chunk
+            except (httpx.ReadError, httpx.RemoteProtocolError,
+                    httpx.ReadTimeout, asyncio.CancelledError):
+                pass  # client disconnected or upstream dropped; normal
+            finally:
+                await resp.aclose()
+                await client.aclose()
+
+        return StreamingResponse(gen(), status_code=status, media_type=media_type)
+
+    return last_response or JSONResponse(
+        {"error": {"message": "all upstream keys failed"}}, status_code=502
+    )
 
 
 # ---------- hourly retry task ----------
